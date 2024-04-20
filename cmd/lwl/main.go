@@ -7,10 +7,13 @@ import (
 	"os/exec"
 	"path"
 	"strings"
+	"syscall"
+	"time"
 
 	"fyne.io/fyne/v2"
 	"fyne.io/fyne/v2/app"
 	"fyne.io/fyne/v2/container"
+	"fyne.io/fyne/v2/data/binding"
 	"fyne.io/fyne/v2/dialog"
 	"fyne.io/fyne/v2/layout"
 	"fyne.io/fyne/v2/widget"
@@ -24,6 +27,12 @@ type game_entry struct {
 	Id          int
 }
 
+type game_state struct {
+	IsPlayed bool
+	Id       int
+	Pid      int
+}
+
 type app_config struct {
 	Game_libary_location string
 	App_location         string
@@ -31,7 +40,8 @@ type app_config struct {
 }
 
 type state struct {
-	SelectedGame game_entry
+	PlayButtonBinding binding.String
+	SelectedGame      game_entry
 }
 
 func new_config() app_config {
@@ -42,7 +52,15 @@ func new_config() app_config {
 	}
 }
 
+func new_state() state {
+	return state{
+		PlayButtonBinding: binding.NewString(),
+	}
+}
+
 var global_state state
+
+var lunched_games map[int]game_state
 
 func setup_log(con *app_config) {
 	log_file := con.Logs_location + "log"
@@ -143,7 +161,7 @@ func delete_game(game *game_entry, w fyne.Window, con *app_config) {
 		log.Fatal(err)
 	}
 
-	main_page(w, con)
+	main_page(w, *con)
 }
 
 func read_libary(con *app_config) []game_entry {
@@ -187,6 +205,52 @@ func read_libary(con *app_config) []game_entry {
 	return game_list
 }
 
+func watch_game_state(game *game_entry, cmd *exec.Cmd) {
+	pid := cmd.Process.Pid
+
+	go func() {
+		_ = cmd.Wait()
+		/*if err != nil {
+			dialog.ShowInformation("Error", "A wait call for game: \""+game.Name+"\" with PID: "+strconv.Itoa(pid)+" failed. This propably means the game crashed durning lunch", w)
+			log.Println("A wait call for game:\"", game.Name, "\"with PID:", strconv.Itoa(pid), "failed.")
+			return
+		}*/
+	}()
+
+	log.Println("Watching game process: \""+game.Name+"\" with PID:", pid)
+
+	for {
+		p, err := os.FindProcess(pid)
+		if err != nil {
+			log.Println("Couldn't watch if process is alive for game: \"" + game.Name + "\"")
+			return
+		}
+
+		if err := p.Signal(syscall.Signal(0)); err != nil {
+			delete(lunched_games, game.Id)
+			log.Println("Game process: \""+game.Name+"\" ended, PID:", pid)
+			return
+		}
+
+		time.Sleep(500 * time.Millisecond)
+	}
+}
+
+func kill_game(game *game_entry, pid int) {
+	if pid == 0 {
+		log.Println("Couldn't find process for game: \"" + game.Name + "\"")
+		return
+	}
+
+	err := syscall.Kill(pid, syscall.SIGTERM)
+	if err != nil {
+		log.Println("Faild to kill game \""+game.Name+"\" PID:", pid)
+		return
+	}
+
+	log.Println("Killed game:", game.Name)
+}
+
 func lunch_game(game *game_entry, w fyne.Window) {
 	game_path := game.Path
 
@@ -200,29 +264,36 @@ func lunch_game(game *game_entry, w fyne.Window) {
 		return
 	}
 
-	log.Println("Lunched game: \"" + game.Name + "\" exec: \"" + game.Path + "\" work dir: \"" + path.Dir(game_path) + "\"")
+	lunched_games[game.Id] = game_state{Pid: cmd.Process.Pid, IsPlayed: true}
+
+	log.Println("Lunched game: \""+game.Name+"\" exec: \""+game.Path+"\" work dir: \""+path.Dir(game_path)+"\"", "Is Played:", lunched_games[game.Id].IsPlayed)
+
+	go watch_game_state(game, cmd)
 }
 
-func main_page(w fyne.Window, con *app_config) {
+func main_page(w fyne.Window, con app_config) {
 	w.Content().Refresh()
 
-	game_list := read_libary(con)
+	game_list := read_libary(&con)
 
 	for game := range game_list {
-		log.Println("Found game: \"" + game_list[game].Name + "\", file:" + con.Game_libary_location + game_list[game].Libary_name)
+		log.Println("Found game: \""+game_list[game].Name+"\", file:"+con.Game_libary_location+game_list[game].Libary_name, "is played:", lunched_games[game_list[game].Id].IsPlayed)
 	}
 
-	list := new_game_list(game_list, w, con)
+	list := new_game_list(game_list, w, &con)
 
-	play_game_button := widget.NewButton("Play", func() {
+	play_game_button := widget.NewButton("Play", nil)
+	stop_game_button := widget.NewButton("Stop", nil)
+
+	play_game_button.OnTapped = func() {
 		if global_state.SelectedGame.Path == "" {
 			return
 		}
 
 		lunch_game(&global_state.SelectedGame, w)
-	})
+	}
 
-	add_game_button := widget.NewButton("Add Game", func() { new_game_page(w, con, game_list) })
+	add_game_button := widget.NewButton("Add Game", func() { new_game_page(w, &con, game_list) })
 
 	button_box := container.New(layout.NewVBoxLayout(), play_game_button, add_game_button)
 
@@ -230,7 +301,22 @@ func main_page(w fyne.Window, con *app_config) {
 
 	list.OnSelected = func(id widget.ListItemID) {
 		global_state.SelectedGame = game_list[id]
-		log.Println("Selected game: \""+game_list[id].Name+"\", list id:", id, "game id:", game_list[id].Id)
+
+		if lunched_games[global_state.SelectedGame.Id].IsPlayed {
+			stop_game_button.OnTapped = func() {
+				kill_game(&global_state.SelectedGame, lunched_games[global_state.SelectedGame.Id].Pid)
+			}
+
+			button_box_stop := container.New(layout.NewVBoxLayout(), stop_game_button, add_game_button)
+
+			content_stop := container.NewBorder(nil, nil, nil, button_box_stop, list)
+
+			w.SetContent(content_stop)
+		} else {
+			w.SetContent(content)
+		}
+
+		log.Println("Selected game: \""+game_list[id].Name+"\", list id:", id, "game id:", game_list[id].Id, "Is Played:", lunched_games[global_state.SelectedGame.Id].IsPlayed)
 	}
 
 	w.SetContent(content)
@@ -251,6 +337,7 @@ func new_game_page(w fyne.Window, con *app_config, game_list []game_entry) {
 		}
 
 		path_game_entry.SetText(reader.URI().Path())
+		game_name_entry.SetText(strings.Split(path.Base(reader.URI().Path()), ".")[0])
 	}, w)
 	path_game_dialog.Resize(fyne.NewSize(1200, 600))
 	path_dialog_button := widget.NewButton("File...", func() {
@@ -277,10 +364,11 @@ func new_game_page(w fyne.Window, con *app_config, game_list []game_entry) {
 			new_game.Id = len(game_list)
 
 			create_game(&new_game, con)
-			main_page(w, con)
+			main_page(w, *con)
 		},
 		OnCancel: func() {
-			main_page(w, con)
+			global_state.SelectedGame = game_entry{}
+			main_page(w, *con)
 		},
 	}
 
@@ -288,7 +376,7 @@ func new_game_page(w fyne.Window, con *app_config, game_list []game_entry) {
 }
 
 func new_game_list(game_list []game_entry, w fyne.Window, con *app_config) *widget.List {
-	return widget.NewList(
+	list := widget.NewList(
 		func() int {
 			return len(game_list)
 		},
@@ -299,7 +387,7 @@ func new_game_list(game_list []game_entry, w fyne.Window, con *app_config) *widg
 			delete_button := widget.NewButton("Delete", nil)
 			delete_button.Importance = widget.DangerImportance
 
-			return container.NewBorder(
+			border_container := container.NewBorder(
 				nil,
 				nil,
 				widget.NewLabel("template"),
@@ -309,6 +397,8 @@ func new_game_list(game_list []game_entry, w fyne.Window, con *app_config) *widg
 				),
 				nil,
 			)
+
+			return border_container
 		},
 		func(i widget.ListItemID, o fyne.CanvasObject) {
 			label := o.(*fyne.Container).Objects[0].(*widget.Label)
@@ -326,19 +416,29 @@ func new_game_list(game_list []game_entry, w fyne.Window, con *app_config) *widg
 				delete_game(&game_list[i], w, con)
 			}
 		})
+
+	for item := range list.Length() {
+		list.SetItemHeight(item, 80)
+	}
+
+	return list
 }
 
 func main() {
 	a := app.New()
 	w := a.NewWindow("LWL")
 
-	config := new_config()
+	con := new_config()
 
-	setup_fs(&config)
+	setup_fs(&con)
+
+	global_state = new_state()
+
+	lunched_games = make(map[int]game_state)
 
 	w.Resize(fyne.NewSize(1600, 800))
 
-	main_page(w, &config)
+	main_page(w, con)
 
 	w.ShowAndRun()
 }
